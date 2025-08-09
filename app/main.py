@@ -1,143 +1,97 @@
+from __future__ import annotations
+
 import os
-import time
-import asyncio
-import logging
-from typing import Optional, List
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-import uvloop  # type: ignore
-uvloop.install()
+from app.exec.order_router import OrderRouter
+from app.paper.engine import PaperEngine
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
-from pydantic import BaseModel, Field
-from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
+app = FastAPI(title="Trading Bot API", version=os.getenv("APP_VERSION", "0.3.0"))
 
-from app.util.logging import setup_logging
-from app.exec.risk_engine import RiskEngine
+# Router / Engine
+MODE = os.getenv("MODE", "paper").lower()
+router = OrderRouter(mode="paper" if MODE not in ("paper", "live") else MODE)
+paper = PaperEngine(router)
 
-# ---- Logging ----
-setup_logging()
-log = logging.getLogger("app")
+# ---------- Models ----------
+class MarketOrderIn(BaseModel):
+    symbol: str
+    side: str      # "buy" | "sell"
+    quantity: float
 
-APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
-APP_START = time.time()
+class LimitOrderIn(MarketOrderIn):
+    price: float
 
-# ---- Metrics ----
-REQ_COUNT = Counter("http_requests_total", "Total HTTP requests", ["path", "method"])
-REQ_LATENCY = Histogram("http_request_latency_seconds", "Request latency", ["path", "method"])
-UPTIME_GAUGE = Gauge("process_uptime_seconds", "Process uptime in seconds")
+class OCOIn(MarketOrderIn):
+    price: float
+    stop_price: float
+    stop_limit_price: float
 
-# ---- App ----
-app = FastAPI(title="Trading Bot API", version=APP_VERSION)
-
-# Global state (skeleton)
-risk = RiskEngine()
-_live_lock = asyncio.Lock()
-_live_running = False
-_live_flat = False
-_current_position_usd = 0.0
-
-# ---- Models ----
-class StartConfig(BaseModel):
-    symbols: List[str] = Field(default_factory=lambda: os.getenv("SYMBOLS", "BTCUSDT").split(","))
-    interval: str = Field(default=os.getenv("INTERVAL", "1h"))
-    capital_base_usd: float = Field(default=float(os.getenv("CAPITAL_BASE_USD", "10000")))
-    mode: str = Field(default="paper")  # "paper" or "live"
-
-class Status(BaseModel):
-    ok: bool
-    version: str
-    uptime_s: float
-
-# ---- Middleware-lite (manual metrics) ----
-@app.middleware("http")
-async def _metrics_mw(request, call_next):
-    start = time.time()
-    path = request.url.path
-    method = request.method
-    REQ_COUNT.labels(path=path, method=method).inc()
-    try:
-        resp = await call_next(request)
-        return resp
-    finally:
-        REQ_LATENCY.labels(path=path, method=method).observe(time.time() - start)
-
-# ---- Endpoints ----
-@app.get("/status", response_model=Status)
+# ---------- Health ----------
+@app.get("/status")
 async def status():
-    uptime = time.time() - APP_START
-    UPTIME_GAUGE.set(uptime)
-    return Status(ok=True, version=APP_VERSION, uptime_s=uptime)
+    return {"ok": True, "version": app.version, "mode": MODE}
 
-@app.get("/metrics")
-async def metrics():
-    return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+# ---------- Orders ----------
+@app.post("/orders/market")
+async def create_market_order(body: MarketOrderIn):
+    side = body.side.lower()
+    if side not in ("buy", "sell"):
+        raise HTTPException(status_code=400, detail="side must be 'buy' or 'sell'")
+    o = await router.place_market(body.symbol, side, body.quantity)
+    return {"ok": True, "order": o.dict()}
 
-@app.get("/risk/summary")
-async def risk_summary():
-    return JSONResponse(risk.summary())
+@app.post("/orders/limit")
+async def create_limit_order(body: LimitOrderIn):
+    side = body.side.lower()
+    if side not in ("buy", "sell"):
+        raise HTTPException(status_code=400, detail="side must be 'buy' or 'sell'")
+    o = await router.place_limit(body.symbol, side, body.quantity, body.price)
+    return {"ok": True, "order": o.dict()}
 
-# ---- Paper orchestrator (skeleton) ----
+@app.post("/orders/oco")
+async def create_oco_order(body: OCOIn):
+    side = body.side.lower()
+    if side not in ("buy", "sell"):
+        raise HTTPException(status_code=400, detail="side must be 'buy' or 'sell'")
+    res = await router.place_oco_stub(
+        body.symbol, side, body.quantity, body.price, body.stop_price, body.stop_limit_price
+    )
+    return {"ok": True, **res}
+
+@app.get("/orders")
+async def list_orders():
+    items = [o.dict() for o in await router.list_orders()]
+    return {"ok": True, "orders": items}
+
+@app.get("/orders/{order_id}")
+async def get_order(order_id: str):
+    o = await router.get_order(order_id)
+    if not o:
+        raise HTTPException(status_code=404, detail="order not found")
+    return {"ok": True, "order": o.dict()}
+
+# ---------- Paper Loop ----------
+class PaperStartIn(BaseModel):
+    symbol: str = "BTCUSDT"
+    interval_s: float = 2.0
+    threshold_bps: float = 15.0
+    trade_qty: float = 0.001
+
 @app.post("/paper/start")
-async def paper_start(cfg: StartConfig, bg: BackgroundTasks):
-    log.info("paper_start", extra=cfg.model_dump())
-    # In Step 2 this will kick off a paper broker loop
-    return {"ok": True, "mode": "paper", "msg": "Paper run started (skeleton)."}
+async def paper_start(body: PaperStartIn):
+    return await paper.start(
+        symbol=body.symbol,
+        interval_s=body.interval_s,
+        threshold_bps=body.threshold_bps,
+        trade_qty=body.trade_qty,
+    )
 
 @app.post("/paper/stop")
 async def paper_stop():
-    log.info("paper_stop")
-    return {"ok": True, "mode": "paper", "msg": "Paper run stopped (skeleton)."}
+    return await paper.stop()
 
-# ---- Live orchestrator (skeleton) ----
-@app.post("/live/start")
-async def live_start(cfg: StartConfig, bg: BackgroundTasks):
-    global _live_running, _live_flat
-    async with _live_lock:
-        if _live_running:
-            return {"ok": True, "mode": "live", "msg": "Already running."}
-        if risk.state.kill_switch or risk.state.trading_halted:
-            raise HTTPException(status_code=423, detail="KillSwitch or Trading Halt active")
-
-        _live_running = True
-        _live_flat = False
-        log.warning("live_start", extra={"cfg": cfg.model_dump()})
-        # Step 2: start background consume loop (WS), route orders etc.
-        return {"ok": True, "mode": "live", "msg": "Live run started (skeleton)."}
-
-@app.post("/live/stop")
-async def live_stop():
-    global _live_running
-    async with _live_lock:
-        if not _live_running:
-            return {"ok": True, "mode": "live", "msg": "Not running."}
-        _live_running = False
-        log.warning("live_stop")
-        return {"ok": True, "mode": "live", "msg": "Live run stopped (skeleton)."}
-
-@app.post("/live/flat")
-async def live_flat():
-    """
-    Kill‑Switch: Sofortige Flat‑Schaltung (State‑Level).
-    In Step 2 werden hier offene Orders gecancelt / Positionen geschlossen.
-    """
-    global _live_flat, _live_running
-    risk.set_kill_switch(True, reason="api_flat")
-    _live_flat = True
-    _live_running = False
-    log.error("live_flat_triggered")
-    return {"ok": True, "mode": "live", "msg": "KillSwitch engaged. Flatten requested."}
-
-@app.get("/live/position")
-async def live_position():
-    return {
-        "ok": True,
-        "running": _live_running,
-        "flat": _live_flat,
-        "position_usd": _current_position_usd,
-    }
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "8080"))
-    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=bool(os.getenv("APP_ENV") == "dev"))
+@app.get("/paper/status")
+async def paper_status():
+    return await paper.status()

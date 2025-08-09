@@ -1,105 +1,133 @@
-import hashlib
-import logging
-import os
-import threading
+from __future__ import annotations
+
+import asyncio
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+import uuid
+from dataclasses import dataclass, asdict
+from typing import Dict, Literal, Optional, List
 
-from app.exec.risk_engine import RiskEngine
+import httpx
 
-log = logging.getLogger(__name__)
 
-try:
-    from binance.spot import Spot as SpotClient  # type: ignore
-except Exception:
-    SpotClient = None  # type: ignore
+Side = Literal["buy", "sell"]
+OrderType = Literal["market", "limit", "oco"]
+OrderStatus = Literal["new", "filled", "partially_filled", "rejected", "canceled"]
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    return os.getenv(name, str(default)).lower() in ("1", "true", "yes", "y", "on")
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
 
 @dataclass
-class OrderResult:
-    ok: bool
-    client_order_id: str
-    exchange_order_id: Optional[str]
-    raw: Dict[str, Any]
+class Order:
+    id: str
+    symbol: str
+    side: Side
+    type: OrderType
+    quantity: float
+    price: Optional[float] = None
+    status: OrderStatus = "new"
+    filled_quantity: float = 0.0
+    avg_fill_price: Optional[float] = None
+    ts_ms: int = 0
+    note: Optional[str] = None
+
+    def dict(self) -> dict:
+        return asdict(self)
+
 
 class OrderRouter:
-    def __init__(self, risk: RiskEngine) -> None:
-        self.risk = risk
-        self.enable_live = _env_bool("ENABLE_LIVE_ORDERS", False)
-        self.lock = threading.Lock()
-        self.cache: Dict[str, OrderResult] = {}
-        self._spot = None
-        if self.enable_live:
-            api_key = os.getenv("BINANCE_TRADE_KEY", "")
-            api_secret = os.getenv("BINANCE_TRADE_SECRET", "")
-            if not api_key or not api_secret:
-                raise RuntimeError("ENABLE_LIVE_ORDERS=true aber Trade-Keys fehlen.")
-            if SpotClient is None:
-                raise RuntimeError("binance-connector nicht installiert.")
-            self._spot = SpotClient(key=api_key, secret=api_secret)
+    """
+    Minimaler Router.
+    - mode='paper' -> füllt Market sofort zum aktuellen Preis (REST Ticker).
+    - Limit-Orders werden 'filled', wenn price erreicht ist (vereinfachte Logik, sofortige Prüfung).
+    - OCO -> Stub (noch ohne echte Logik).
+    """
+    def __init__(self, mode: Literal["paper", "live"] = "paper") -> None:
+        self.mode = mode
+        self._orders: Dict[str, Order] = {}
+        self._lock = asyncio.Lock()
 
-    @staticmethod
-    def make_client_order_id(symbol: str, side: str, qty: str, idem_key: str) -> str:
-        base = f"{symbol}|{side}|{qty}|{idem_key}"
-        return hashlib.sha1(base.encode("utf-8")).hexdigest()[:24]
+    # ---------- Public API ----------
+    async def place_market(self, symbol: str, side: Side, quantity: float) -> Order:
+        symbol = self._normalize_symbol(symbol)
+        now = int(time.time() * 1000)
 
-    def place_market_quote(self, symbol: str, side: str, quote_qty_usd: float,
-                           idem_key: str, est_risk_usd: Optional[float] = None) -> OrderResult:
-        qty_str = f"{quote_qty_usd:.2f}"
-        coid = self.make_client_order_id(symbol, side, qty_str, idem_key)
-        with self.lock:
-            if coid in self.cache:
-                log.info("idempotent_hit", extra={"client_order_id": coid})
-                return self.cache[coid]
-            risk_amt = est_risk_usd if est_risk_usd is not None else self.risk.allowed_risk_per_trade_usd()
-            ok, reason = self.risk.pre_trade_check(risk_amt)
-            if not ok:
-                res = OrderResult(ok=False, client_order_id=coid, exchange_order_id=None, raw={"reason": reason})
-                self.cache[coid] = res
-                return res
-            if not self.enable_live or self._spot is None:
-                res = OrderResult(
-                    ok=True, client_order_id=coid, exchange_order_id=None,
-                    raw={"dry_run": True, "symbol": symbol, "side": side, "type": "MARKET",
-                         "quoteOrderQty": qty_str, "ts": _now_ms()}
-                )
-                self.cache[coid] = res
-                return res
-            try:
-                resp = self._spot.new_order(
-                    symbol=symbol.upper(), side=side, type="MARKET",
-                    quoteOrderQty=qty_str, newClientOrderId=coid,
-                )
-                res = OrderResult(ok=True, client_order_id=coid,
-                                  exchange_order_id=str(resp.get("orderId")), raw=resp)
-                self.cache[coid] = res
-                return res
-            except Exception as e:
-                log.exception("place_market_quote_error")
-                res = OrderResult(ok=False, client_order_id=coid, exchange_order_id=None, raw={"error": str(e)})
-                self.cache[coid] = res
-                return res
+        # Preis holen
+        px = await self._get_last_price(symbol)
 
-    def get_order(self, symbol: str, client_order_id: str) -> Dict[str, Any]:
-        if not self.enable_live or self._spot is None:
-            return {"dry_run": True, "clientOrderId": client_order_id, "status": "SIMULATED"}
-        try:
-            return self._spot.get_order(symbol=symbol.upper(), origClientOrderId=client_order_id)
-        except Exception as e:
-            return {"error": str(e), "clientOrderId": client_order_id}
+        order = Order(
+            id=str(uuid.uuid4()),
+            symbol=symbol,
+            side=side,
+            type="market",
+            quantity=quantity,
+            status="filled" if self.mode == "paper" else "new",
+            filled_quantity=quantity if self.mode == "paper" else 0.0,
+            avg_fill_price=px if self.mode == "paper" else None,
+            ts_ms=now,
+            note="paper fill" if self.mode == "paper" else None,
+        )
+        async with self._lock:
+            self._orders[order.id] = order
+        return order
 
-    def open_orders(self, symbol: Optional[str] = None) -> Dict[str, Any]:
-        if not self.enable_live or self._spot is None:
-            return {"dry_run": True, "orders": []}
-        try:
-            if symbol:
-                return {"orders": self._spot.get_open_orders(symbol=symbol.upper())}
-            return {"orders": self._spot.get_open_orders()}
-        except Exception as e:
-            return {"error": str(e)}
+    async def place_limit(self, symbol: str, side: Side, quantity: float, price: float) -> Order:
+        symbol = self._normalize_symbol(symbol)
+        now = int(time.time() * 1000)
+
+        order = Order(
+            id=str(uuid.uuid4()),
+            symbol=symbol,
+            side=side,
+            type="limit",
+            quantity=quantity,
+            price=price,
+            status="new",
+            ts_ms=now,
+        )
+
+        # vereinfachte Sofort-Prüfung: wenn limit 'in the money', sofort füllen
+        last = await self._get_last_price(symbol)
+        should_fill = (side == "buy" and last <= price) or (side == "sell" and last >= price)
+        if self.mode == "paper" and should_fill:
+            order.status = "filled"
+            order.filled_quantity = quantity
+            order.avg_fill_price = last
+            order.note = "paper limit immediate fill"
+
+        async with self._lock:
+            self._orders[order.id] = order
+        return order
+
+    async def place_oco_stub(self, symbol: str, side: Side, quantity: float,
+                             price: float, stop_price: float, stop_limit_price: float) -> dict:
+        symbol = self._normalize_symbol(symbol)
+        oco_id = str(uuid.uuid4())
+        note = "OCO stub gespeichert (keine Live-Logik in Step 3/2.1)"
+        async with self._lock:
+            self._orders[oco_id] = Order(
+                id=oco_id, symbol=symbol, side=side, type="oco",
+                quantity=quantity, price=price, status="new", ts_ms=int(time.time()*1000),
+                note=note
+            )
+        return {"oco_id": oco_id, "note": note}
+
+    async def get_order(self, order_id: str) -> Optional[Order]:
+        async with self._lock:
+            return self._orders.get(order_id)
+
+    async def list_orders(self) -> List[Order]:
+        async with self._lock:
+            return list(self._orders.values())
+
+    # ---------- Helpers ----------
+    async def _get_last_price(self, symbol: str) -> float:
+        # nutzt Binance REST /api/v3/ticker/price
+        url = "https://api.binance.com/api/v3/ticker/price"
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(url, params={"symbol": symbol})
+            r.raise_for_status()
+            px = float(r.json()["price"])
+            return px
+
+    def _normalize_symbol(self, symbol: str) -> str:
+        """BTCUSDT, ethusdt, BTC-USDT, BTC/USDT -> BTCUSDT"""
+        s = symbol.upper().replace("-", "").replace("/", "")
+        return s
